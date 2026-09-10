@@ -33,6 +33,10 @@ $GhExe = Resolve-Tool 'gh' @(
     'C:\Program Files\GitHub CLI\gh.exe'
 )
 
+$env:PYTHONUTF8 = '1'
+$env:PYTHONIOENCODING = 'utf-8'
+$env:GH_NO_UPDATE_NOTIFIER = '1'
+
 if (-not $GitExe) { throw 'git not found. Install Git for Windows.' }
 if (-not $GhExe) { throw 'gh not found. Install GitHub CLI or restore portable-dev-tools\gh.' }
 

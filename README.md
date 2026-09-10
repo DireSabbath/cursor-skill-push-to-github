@@ -1,46 +1,45 @@
 # cursor-skill-push-to-github
 
-Cursor Agent Skill：在 Windows 上把当前项目发布到 GitHub。默认创建**私有**仓库。
+Cursor Agent Skill: commit a local project and publish it to GitHub **without** `git push`.
 
-部分网络无法对 `github.com:443` 执行 `git push`（连接被重置）。本技能改用 GitHub API 写入提交树，**不会**调用 `git push` 或 `gh repo create --push`。
+On some networks `git push` to `github.com:443` fails. This skill uses a logged-in GitHub CLI token, then keep-alive HTTPS to `api.github.com`. Unchanged blobs are reused by SHA. **Do not** `git push` or `gh repo create --push`.
 
-## 安装
+## Install
 
-把本仓库复制为：
+Copy this repository to:
 
 ```text
 %USERPROFILE%\.cursor\skills\push-to-github\
 ```
 
-目录内必须有 `SKILL.md`。复制后对 Agent 说「推到 GitHub」即可。
+## Requirements
 
-## 依赖
+- Git for Windows (local commits only)
+- [GitHub CLI](https://cli.github.com/) (`gh auth login`)
+- Python 3
 
-- [Git for Windows](https://git-scm.com/download/win)
-- [GitHub CLI](https://cli.github.com/)，并完成 `gh auth login`
-
-Agent 新开的 shell 往往没有 Git / gh 的 PATH。先执行：
+Agent shells often lack `git`/`gh` on PATH. Run:
 
 ```powershell
 . "$env:USERPROFILE/.cursor/skills/push-to-github/scripts/ensure-tools.ps1"
 ```
 
-## 做什么
+## Usage
 
-1. 如有需要则 `git init`
-2. 检查并补全 `.gitignore`（排除密钥、日志、`.env`）
-3. 本地 `git commit`（不修改 git config；缺身份时用当前 `gh` 登录名的 noreply 邮箱）
-4. 没有 `origin` 时用 `gh repo create` 建仓（不加 `--push`）
-5. 运行 [`scripts/publish-via-gh-api.py`](scripts/publish-via-gh-api.py)，通过 Contents API + Git Data API 把 HEAD 写到 `origin`
+1. Inspect remotes; `git init -b main` if needed
+2. Ignore secrets; write `.gitignore` as UTF-8 via Python
+3. Commit with env-var identity if `user.name` is unset (never `git config`)
+4. `gh repo create <name> --private --source=. --remote=origin` (no `--push`) only when `origin` is missing
+5. `python .../publish-via-gh-api.py`
 
-完整流程见 [SKILL.md](SKILL.md)，Windows 细节见 [reference.md](reference.md)。
+## Implementation notes
 
-## 硬限制
+- Call `gh` once for `auth token`; do not spawn `gh.exe` per blob
+- Empty repo: Contents API bootstrap, then Git Data API tree + commit
+- Reuse remote blob SHAs that already match `git hash-object`
+- PATCH ref uses `"force": false`
 
-- 不运行 `git config` / `git push` / force-push
-- 不删除 GitHub 仓库，不改已有 remote
-- 不跳过 hooks
-- 不提交密钥
+Agent flow: [SKILL.md](SKILL.md). Local notes: [reference.md](reference.md).
 
 ## License
 

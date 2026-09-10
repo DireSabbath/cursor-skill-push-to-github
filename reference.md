@@ -5,11 +5,11 @@
 | Tool | Typical path | Notes |
 |------|----------------|-------|
 | Git | `C:/Program Files/Git/cmd/git.exe` | Local commits only. Often missing from agent PATH |
-| GitHub CLI | `%LOCALAPPDATA%/portable-dev-tools/gh/bin/gh.exe` or GitHub CLI install dir | Exclusive publish path (`gh api`) |
+| GitHub CLI | `%LOCALAPPDATA%/portable-dev-tools/gh/bin/gh.exe` or GitHub CLI install dir | `gh auth token` only. Publish is keep-alive to api.github.com |
 
-On some Windows networks `git` cannot reach `github.com:443`, so files are written with the GitHub API.
+On some networks git to github.com:443 fails, so files are written with the GitHub API.
 
-Before any `git` / `gh` command in a new shell:
+Before any `git`/`gh` command in a new shell:
 
 ```powershell
 . "$env:USERPROFILE/.cursor/skills/push-to-github/scripts/ensure-tools.ps1"
@@ -21,7 +21,7 @@ Or prepend PATH:
 $env:Path = "C:\Program Files\Git\cmd;$env:LOCALAPPDATA\portable-dev-tools\gh\bin;" + $env:Path
 ```
 
-Adjust the `gh` directory if you installed GitHub CLI normally.
+`ensure-tools.ps1` also sets `PYTHONUTF8` / `PYTHONIOENCODING=utf-8`.
 
 ## Identity without changing git config
 
@@ -40,9 +40,8 @@ $env:GIT_COMMITTER_EMAIL = $env:GIT_AUTHOR_EMAIL
 Always gitignore (do not stage):
 
 - `.env`, `.env.*`, `credentials.json`, `*secret*`, `*token*`
-- files whose names contain `密码` / `账号` / `password`
 - log directories
-- key / pem / p12 files
+- key/pem/p12 files
 
 Write `.gitignore` as UTF-8 (Python `encoding='utf-8'`). Scan before `git add`:
 
@@ -50,8 +49,6 @@ Write `.gitignore` as UTF-8 (Python `encoding='utf-8'`). Scan before `git add`:
 git status --porcelain
 git diff --cached --stat
 ```
-
-Unstage credential filenames by matching `密码` / `账号` / `password` via Python + `git rm --cached`.
 
 ## Default repo policy
 
@@ -62,6 +59,7 @@ Unstage credential filenames by matching `密码` / `账号` / `password` via Py
 - Do not change existing remotes
 - Do not `git push --force` to `main`/`master`
 - Do not `git push` at all
+- TEMP public copies: `origin` only on the TEMP git
 
 ## Create repo (no push)
 
@@ -79,4 +77,4 @@ From the project root, after a local commit:
 python "$env:USERPROFILE/.cursor/skills/push-to-github/scripts/publish-via-gh-api.py"
 ```
 
-The script bootstraps an empty GitHub repo with the Contents API, then writes the HEAD tree with the Git Data API. It never calls `git push`.
+Keep-alive to `api.github.com` (do not spawn `gh.exe` per blob). Bootstraps an empty repo with Contents API, then Git Data API. Reuses remote blob SHAs that already match `git hash-object`. Never `git push`. PATCH ref uses `"force": false`.

@@ -2,19 +2,20 @@
 name: push-to-github
 description: >-
   Initialize git if needed, exclude secrets, commit, create a GitHub repo with
-  gh, and publish via GitHub API from Windows. Use when the user asks to 传到
-  GitHub, 上传 GitHub, 推到 GitHub, push to GitHub, create a GitHub
-  repository, or gh repo create — especially when git push to github.com:443
-  fails.
+  gh, and publish via GitHub API on Windows. Use when the user asks to push to
+  GitHub, create a GitHub repository, or gh repo create — especially when git
+  push to github.com:443 fails.
 ---
 
 # Push current project to GitHub
 
-Cursor skill for Windows. Default visibility is **private**.
+Cursor skill for Windows. Uses the logged-in **gh** account. Default visibility is **private**.
 
-On some networks `git push` / `git clone` to `github.com:443` is reset. Publish the HEAD tree through the GitHub API instead.
+On some networks git to GitHub on port 443 fails, so files are written with the GitHub API.
 
 Do not `git push`. Do not `gh repo create --push`. Publish only with [scripts/publish-via-gh-api.py](scripts/publish-via-gh-api.py).
+
+Same lesson as github-partial-download: `gh auth token` once, then keep-alive HTTPS to `api.github.com`. Do **not** spawn `gh.exe` per blob. Unchanged blobs are reused by SHA.
 
 ## Install
 
@@ -23,8 +24,6 @@ Copy this folder to:
 ```text
 %USERPROFILE%\.cursor\skills\push-to-github\
 ```
-
-Keep the folder name `push-to-github` so the paths below match.
 
 ## 0. Load tools (every new shell)
 
@@ -40,7 +39,9 @@ gh auth status
 
 If not logged in, run `gh auth login` and wait for the browser step. Never ask the user to paste tokens.
 
-Windows PATH notes and commit identity env vars: [reference.md](reference.md).
+`ensure-tools.ps1` sets `PYTHONUTF8=1` and `PYTHONIOENCODING=utf-8`.
+
+Windows PATH notes and identity env vars: [reference.md](reference.md).
 
 ## 1. Inspect the workspace
 
@@ -55,22 +56,22 @@ git status --porcelain
 
 Default repo name: project folder, lowercase, dashes only. If the folder is a single character or otherwise ambiguous (`1`, `new`, `tmp`), derive a name from the main artifact (e.g. exe/title) or ask once.
 
+For a **TEMP** sanitized public copy, attach `origin` only to that TEMP git. Never rewrite remotes on the source tree.
+
 ## 2. Secrets and .gitignore
 
 Before staging, list what would be committed. Ensure `.gitignore` covers:
 
 - dependency dirs, build output
-- `.env*`, keys, credential files
-- logs
-- files whose names suggest secrets (`*password*`, `*secret*`, `*token*`, or Chinese `*密码*` / `*账号*`)
+- `.env*`, keys, credential files, logs
 
 If a file looks like a secret and is not ignored, **ask before including it**. Never stage-and-push blind.
 
-On Windows, write `.gitignore` as UTF-8 via Python (`encoding='utf-8'`). Some editors corrupt Chinese filenames.
+Write `.gitignore` as UTF-8 via Python on Windows; some editors can corrupt non-ASCII filenames.
 
 ## 3. Commit
 
-Never update git config. If `user.name` / `user.email` are missing, use the env-var identity in [reference.md](reference.md).
+Never update git config. If `user.name`/`user.email` are missing, use the env-var identity in [reference.md](reference.md).
 
 ```powershell
 git add -A
@@ -96,11 +97,13 @@ Then from the project root (also when `origin` already exists):
 python "$env:USERPROFILE/.cursor/skills/push-to-github/scripts/publish-via-gh-api.py"
 ```
 
+The script bootstraps an empty GitHub repo with Contents API, then writes the HEAD tree with Git Data API. Unchanged files are not re-POSTed (`blobs posted=` / `reused=`). It never calls `git push`.
+
 Do not create a second repo.
 
 ## 5. Report
 
-Return the HTTPS URL (`https://github.com/<owner>/<name>` from the logged-in `gh` account), private/public, and what was excluded (secrets, logs).
+Return the HTTPS URL (`https://github.com/<login>/<name>`), private/public, what was excluded (secrets, logs), and blob posted vs reused.
 
 ## Hard limits
 
