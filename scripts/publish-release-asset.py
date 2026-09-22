@@ -2,13 +2,15 @@
 """Put one archive on a new private GitHub Release.
 
 The archive's parent is never git-init'd. The git tree is a TEMP README
-published by publish-via-gh-api.py. The file itself is one POST to
-uploads.github.com. Do not git push. Do not gh release create.
+published by publish-via-gh-api.py. Each part is one POST to
+uploads.github.com. A file that is not under 2 GiB is sent as raw
+byte-range parts of the original file. Do not git push. Do not gh release create.
 """
 from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import http.client
 import importlib.util
 import json
@@ -21,12 +23,16 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from urllib.parse import quote
 
+# GitHub: each Release file must be under 2 GiB. 2 GiB itself is rejected.
 MAX_RELEASE_BYTES = 2 * 1024 * 1024 * 1024
+PART_LIMIT = MAX_RELEASE_BYTES - 1
 PROXY_MIN_BYTES = 8 * 1024 * 1024
 UPLOAD_BLOCK = 1024 * 1024
+PROGRESS_BYTES = 64 * 1024 * 1024
 UPLOAD_HOST = "uploads.github.com"
 DEFAULT_PROXY = "127.0.0.1:20221"
 MARKER = "<!-- push-to-github-release-asset -->"
@@ -84,6 +90,138 @@ def asset_names(original_name: str, repo: str) -> tuple[str, str]:
     return name, label
 
 
+class AssetPart:
+    def __init__(
+        self,
+        index: int,
+        count: int,
+        start: int,
+        size: int,
+        download: str,
+        label: str,
+    ) -> None:
+        self.index = index
+        self.count = count
+        self.start = start
+        self.size = size
+        self.download = download
+        self.label = label
+        self.sha256 = ""
+
+
+def part_asset_names(original_name: str, repo: str, index: int) -> tuple[str, str]:
+    """ASCII download name plus a label that still names the original file."""
+    suffix = f".{index:03d}"
+    label = f"{original_name}{suffix}"
+    candidates: list[str] = []
+    if original_name.isascii():
+        candidates.append(original_name + suffix)
+    candidates.append(f"{repo}{split_suffix(original_name)}{suffix}")
+    candidates.append(f"{repo}.part{index:03d}")
+    for name in candidates:
+        if SAFE_ASSET.fullmatch(name):
+            return name, label
+    return f"release-asset.part{index:03d}", label
+
+
+def plan_parts(original_name: str, total: int, repo: str) -> list[AssetPart]:
+    """One asset when the file is under 2 GiB, otherwise raw byte-range parts.
+
+    Parts are not zip or 7z volumes. Each one is at most 2 GiB - 1 byte.
+    """
+    if total <= 0:
+        raise SystemExit("archive is empty")
+    if total < MAX_RELEASE_BYTES:
+        download, label = asset_names(original_name, repo)
+        return [AssetPart(1, 1, 0, total, download, label)]
+    count = (total + PART_LIMIT - 1) // PART_LIMIT
+    if count > 1000:
+        raise SystemExit(f"{count} parts exceeds the 1000-asset Release limit")
+    parts: list[AssetPart] = []
+    offset = 0
+    for index in range(1, count + 1):
+        size = min(PART_LIMIT, total - offset)
+        download, label = part_asset_names(original_name, repo, index)
+        parts.append(AssetPart(index, count, offset, size, download, label))
+        offset += size
+    if offset != total:
+        raise SystemExit("split plan does not cover the archive")
+    names = [part.download for part in parts]
+    if len(names) != len(set(names)):
+        raise SystemExit("split asset names are not unique")
+    return parts
+
+
+def fill_sha256(archive: Path, parts: list[AssetPart]) -> None:
+    print("hashing archive for part checksums", flush=True)
+    for part in parts:
+        sha = hashlib.sha256()
+        sent = 0
+        next_mark = PROGRESS_BYTES
+        started = time.time()
+        with archive.open("rb") as handle:
+            handle.seek(part.start)
+            left = part.size
+            while left:
+                buf = handle.read(min(UPLOAD_BLOCK, left))
+                if not buf:
+                    raise SystemExit(f"short read hashing {part.download}")
+                sha.update(buf)
+                left -= len(buf)
+                sent += len(buf)
+                if sent >= next_mark or left == 0:
+                    elapsed = time.time() - started
+                    rate = sent / elapsed / 1_000_000 if elapsed else 0
+                    print(
+                        f"hash {part.download} {sent}/{part.size} {rate:.1f} MB/s",
+                        flush=True,
+                    )
+                    while next_mark <= sent:
+                        next_mark += PROGRESS_BYTES
+        part.sha256 = sha.hexdigest()
+        print(f"sha256 {part.download} {part.sha256}", flush=True)
+
+
+class SliceReader:
+    """Read one byte range from the original archive. No second copy is written."""
+
+    def __init__(self, path: Path, start: int, length: int, label: str) -> None:
+        self._fh = path.open("rb")
+        self._fh.seek(start)
+        self._left = length
+        self._sent = 0
+        self._length = length
+        self._label = label
+        self._next = PROGRESS_BYTES
+        self._started = time.time()
+        self.sha256 = hashlib.sha256()
+
+    def read(self, size: int = -1) -> bytes:
+        if self._left <= 0:
+            return b""
+        if size is None or size < 0 or size > self._left:
+            size = self._left
+        data = self._fh.read(size)
+        if not data:
+            return b""
+        self._left -= len(data)
+        self._sent += len(data)
+        self.sha256.update(data)
+        if self._sent >= self._next or self._left == 0:
+            elapsed = time.time() - self._started
+            rate = self._sent / elapsed / 1_000_000 if elapsed else 0
+            print(
+                f"upload {self._label} {self._sent}/{self._length} {rate:.2f} MB/s",
+                flush=True,
+            )
+            while self._next <= self._sent:
+                self._next += PROGRESS_BYTES
+        return data
+
+    def close(self) -> None:
+        self._fh.close()
+
+
 def looks_secret(path: Path) -> str | None:
     name = path.name
     lower = name.lower()
@@ -126,6 +264,49 @@ def self_check() -> None:
     assert want_proxy(100, "http://127.0.0.1:9", False) == ("127.0.0.1", 9)
     assert connect_established(b"HTTP/1.1 200 Connection Established\r\n\r\n")
     assert not connect_established(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+    one = plan_parts("Setup-1.2.exe", 100, "setup-1-2")
+    assert len(one) == 1 and one[0].download == "Setup-1.2.exe" and one[0].size == 100
+    under = plan_parts("a.bin", PART_LIMIT, "a-bin")
+    assert len(under) == 1 and under[0].size == PART_LIMIT
+    boundary = plan_parts("a.bin", MAX_RELEASE_BYTES, "a-bin")
+    assert len(boundary) == 2
+    assert boundary[0].size == PART_LIMIT and boundary[1].size == 1
+    assert boundary[0].download == "a.bin.001" and boundary[1].start == PART_LIMIT
+    wide = (PART_LIMIT * 2) + 3
+    three = plan_parts("Archive.ipa", wide, "archive-ipa")
+    assert [part.download for part in three] == [
+        "Archive.ipa.001",
+        "Archive.ipa.002",
+        "Archive.ipa.003",
+    ]
+    assert three[0].size == PART_LIMIT and three[2].size == 3
+    assert three[0].size + three[1].size + three[2].size == wide
+    split_original = "\u53d1\u5e03\u5305Network.7z"
+    split_parts = plan_parts(split_original, MAX_RELEASE_BYTES + 10, "network")
+    assert split_parts[0].download == "network.7z.001"
+    assert split_parts[0].label == split_original + ".001"
+    assert split_parts[1].download == "network.7z.002"
+    joined = join_hint(split_original, split_parts)
+    assert "copy /b" in joined and "network.7z.001" in joined
+    note = readme_text("owner/network", "v1.0.0", split_original, MAX_RELEASE_BYTES + 10, split_parts)
+    assert MARKER in note and "copy /b" in note and "not zip or 7z" in note
+    single_note = readme_text("owner/setup-1-2", "v1.0.0", "Setup-1.2.exe", 100, one)
+    assert "Download name: `Setup-1.2.exe`" in single_note and "copy /b" not in single_note
+    sample = Path(tempfile.mkdtemp())
+    try:
+        blob = sample / "blob.bin"
+        blob.write_bytes(b"abcdefghijklmnopqrstuvwxyz")
+        hashed = plan_parts("blob.bin", 26, "blob-bin")
+        fill_sha256(blob, hashed)
+        assert hashed[0].sha256 == hashlib.sha256(b"abcdefghijklmnopqrstuvwxyz").hexdigest()
+        reader = SliceReader(blob, 4, 6, "blob.bin")
+        assert reader.read(2) == b"ef"
+        assert reader.read(100) == b"ghij"
+        assert reader.read(1) == b""
+        assert reader.sha256.hexdigest() == hashlib.sha256(b"efghij").hexdigest()
+        reader.close()
+    finally:
+        remove_tree(sample)
     print("check ok")
 
 
@@ -161,21 +342,113 @@ def author_env(login: str) -> dict[str, str]:
     return env
 
 
-def readme_text(owner_repo: str, tag: str, download: str, label: str, size: int) -> str:
-    return (
-        f"{MARKER}\n\n"
-        f"# {owner_repo.split('/')[-1]}\n\n"
-        "The archive is a Release asset, not a git blob.\n\n"
-        f"- Release: https://github.com/{owner_repo}/releases/tag/{tag}\n"
-        f"- Download name: `{download}`\n"
-        f"- Original filename: `{label}`\n"
-        f"- Size: {size} bytes\n"
-    )
+def join_hint(original_name: str, parts: list[AssetPart]) -> str:
+    joined = "+".join(f'"{part.download}"' for part in parts)
+    return f'copy /b {joined} "{original_name}"'
 
 
-def write_stage(stage: Path, owner_repo: str, tag: str, download: str, label: str, size: int) -> None:
+def readme_text(
+    owner_repo: str,
+    tag: str,
+    original_name: str,
+    total: int,
+    parts: list[AssetPart],
+) -> str:
+    if len(parts) == 1:
+        part = parts[0]
+        return (
+            f"{MARKER}\n\n"
+            f"# {owner_repo.split('/')[-1]}\n\n"
+            "The archive is a Release asset, not a git blob.\n\n"
+            f"- Release: https://github.com/{owner_repo}/releases/tag/{tag}\n"
+            f"- Download name: `{part.download}`\n"
+            f"- Original filename: `{original_name}`\n"
+            f"- Size: {total} bytes\n"
+        )
+    lines = [
+        MARKER,
+        "",
+        f"# {owner_repo.split('/')[-1]}",
+        "",
+        "The archive is a Release asset, not a git blob.",
+        "",
+        f"- Release: https://github.com/{owner_repo}/releases/tag/{tag}",
+        f"- Original filename: `{original_name}`",
+        f"- Size: {total} bytes",
+        "",
+        "GitHub requires each Release file to be under 2 GiB, so this file is stored as raw byte ranges.",
+        "These parts are not zip or 7z volumes. Join them in order to rebuild the original bytes.",
+        "",
+        "Windows:",
+        "",
+        "```bat",
+        join_hint(original_name, parts),
+        "```",
+        "",
+        "Python:",
+        "",
+        "```python",
+        "from pathlib import Path",
+        f"parts = [{', '.join(repr(part.download) for part in parts)}]",
+        f"destination = Path({original_name!r})",
+        "with destination.open('wb') as target:",
+        "    for name in parts:",
+        "        with Path(name).open('rb') as source:",
+        "            while True:",
+        "                chunk = source.read(1024 * 1024)",
+        "                if not chunk:",
+        "                    break",
+        "                target.write(chunk)",
+        "```",
+        "",
+        "Parts:",
+    ]
+    for part in parts:
+        digest = f" sha256 `{part.sha256}`" if part.sha256 else ""
+        lines.append(
+            f"- `{part.download}` label `{part.label}` offset {part.start} size {part.size} bytes{digest}"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def release_body(original_name: str, total: int, parts: list[AssetPart]) -> str:
+    lines = [
+        "Archive published as a Release asset so the binary stays out of git history.",
+        "",
+        f"Original filename: {original_name}",
+        f"Size: {total} bytes",
+    ]
+    if len(parts) == 1:
+        lines.append(f"Download name: {parts[0].download}")
+        if parts[0].sha256:
+            lines.append(f"sha256: {parts[0].sha256}")
+        return "\n".join(lines) + "\n"
+    lines.append("")
+    lines.append("Split into raw byte ranges because each Release file must be under 2 GiB.")
+    lines.append("These parts are not zip or 7z volumes. Join them in order.")
+    lines.append("")
+    lines.append("Windows:")
+    lines.append(join_hint(original_name, parts))
+    lines.append("")
+    for part in parts:
+        digest = f" sha256 {part.sha256}" if part.sha256 else ""
+        lines.append(
+            f"- {part.download} offset {part.start} size {part.size}{digest}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def write_stage(
+    stage: Path,
+    owner_repo: str,
+    tag: str,
+    original_name: str,
+    total: int,
+    parts: list[AssetPart],
+) -> None:
     (stage / "README.md").write_text(
-        readme_text(owner_repo, tag, download, label, size),
+        readme_text(owner_repo, tag, original_name, total, parts),
         encoding="utf-8",
         newline="\n",
     )
@@ -197,6 +470,7 @@ def write_stage(stage: Path, owner_repo: str, tag: str, download: str, label: st
                 "*.dmg",
                 "*.tar",
                 "*.gz",
+                "*.ipa",
                 "",
             ]
         ),
@@ -205,18 +479,41 @@ def write_stage(stage: Path, owner_repo: str, tag: str, download: str, label: st
     )
 
 
-def asset_matches(release: dict, download: str, label: str, size: int) -> bool:
+def placed_asset(release: dict, part: AssetPart) -> dict | None:
     for asset in release.get("assets") or []:
         if asset.get("state") not in (None, "uploaded"):
             continue
-        if int(asset.get("size") or -1) != size:
+        if asset.get("name") != part.download and asset.get("label") != part.label:
             continue
-        if asset.get("name") == download or asset.get("label") == label:
-            return True
-    return False
+        if int(asset.get("size") or -1) != part.size:
+            continue
+        return asset
+    return None
 
 
-def readme_matches(client, owner_repo: str, label: str, size: int) -> bool:
+def reject_size_conflict(release: dict, part: AssetPart) -> None:
+    for asset in release.get("assets") or []:
+        if asset.get("state") not in (None, "uploaded"):
+            continue
+        if asset.get("name") != part.download and asset.get("label") != part.label:
+            continue
+        if int(asset.get("size") or -1) != part.size:
+            raise SystemExit(
+                f"asset {part.download} exists with size {asset.get('size')} != {part.size}"
+            )
+
+
+def parts_uploaded(release: dict, parts: list[AssetPart]) -> bool:
+    return all(placed_asset(release, part) is not None for part in parts)
+
+
+def readme_matches(
+    client,
+    owner_repo: str,
+    original_name: str,
+    total: int,
+    parts: list[AssetPart],
+) -> bool:
     status, parsed, _text = client.request(
         "GET",
         f"/repos/{owner_repo}/contents/README.md",
@@ -229,10 +526,19 @@ def readme_matches(client, owner_repo: str, label: str, size: int) -> bool:
         text = base64.b64decode(raw).decode("utf-8", errors="replace")
     except (ValueError, TypeError):
         return False
-    return MARKER in text and label in text and str(size) in text
+    if MARKER not in text or original_name not in text or str(total) not in text:
+        return False
+    return all(part.download in text and str(part.size) in text for part in parts)
 
 
-def classify(client, owner_repo: str, tag: str, download: str, label: str, size: int) -> str:
+def classify(
+    client,
+    owner_repo: str,
+    tag: str,
+    original_name: str,
+    total: int,
+    parts: list[AssetPart],
+) -> str:
     status, repo, _text = client.request("GET", f"/repos/{owner_repo}", allow_http=(404,))
     if status == 404:
         return "create"
@@ -241,15 +547,15 @@ def classify(client, owner_repo: str, tag: str, download: str, label: str, size:
     if repo.get("default_branch") not in (None, "main"):
         return "unrelated"
     description = repo.get("description") or ""
-    ours = description.startswith("Release asset. Original file:") and label in description
+    ours = description.startswith("Release asset. Original file:") and original_name in description
     status, release, _text = client.request(
         "GET",
         f"/repos/{owner_repo}/releases/tags/{quote(tag, safe='')}",
         allow_http=(404,),
     )
-    if status == 200 and isinstance(release, dict) and asset_matches(release, download, label, size):
+    if status == 200 and isinstance(release, dict) and parts_uploaded(release, parts):
         return "uptodate"
-    if readme_matches(client, owner_repo, label, size):
+    if readme_matches(client, owner_repo, original_name, total, parts):
         return "reuse"
     if ours and int(repo.get("size") or 0) == 0:
         return "reuse"
@@ -264,13 +570,13 @@ def decide(
     original_name: str,
     size: int,
     public: bool,
-) -> tuple[str, str, str, str]:
+) -> tuple[str, str, list[AssetPart]]:
     names = [base_name] if base_name.endswith("-pkg") else [base_name, f"{base_name}-pkg"]
     blocked: list[str] = []
     for name in names:
-        download, label = asset_names(original_name, name)
+        parts = plan_parts(original_name, size, name)
         owner_repo = f"{login}/{name}"
-        kind = classify(client, owner_repo, tag, download, label, size)
+        kind = classify(client, owner_repo, tag, original_name, size, parts)
         print(f"name {name}: {kind}")
         if kind in {"reuse", "uptodate"}:
             _status, repo, _text = client.request("GET", f"/repos/{owner_repo}")
@@ -279,7 +585,7 @@ def decide(
         if kind in {"create", "reuse", "uptodate"}:
             if name != base_name:
                 print(f"name taken, using {name}")
-            return kind, name, download, label
+            return kind, name, parts
         blocked.append(name)
     raise SystemExit(
         "repo name belongs to another project: " + ", ".join(f"{login}/{item}" for item in blocked)
@@ -441,21 +747,47 @@ def open_proxied(timeout: int, proxy: tuple[str, int]) -> http.client.HTTPSConne
         raise ProxyConnectError(str(exc)) from exc
 
 
-def upload_asset(token: str, owner_repo: str, release_id: int, download: str, label: str, archive: Path) -> dict:
-    size = archive.stat().st_size
-    query = f"name={quote(download)}&label={quote(label)}"
+def drop_incomplete(client, owner_repo: str, release: dict, part: AssetPart) -> None:
+    kept = []
+    for item in release.get("assets") or []:
+        same = item.get("name") == part.download or item.get("label") == part.label
+        if same and item.get("state") not in (None, "uploaded"):
+            asset_id = item.get("id")
+            print(
+                f"deleting incomplete asset {part.download} state={item.get('state')}",
+                flush=True,
+            )
+            if asset_id:
+                client.request(
+                    "DELETE",
+                    f"/repos/{owner_repo}/releases/assets/{asset_id}",
+                    allow_http=(404,),
+                )
+            continue
+        kept.append(item)
+    release["assets"] = kept
+
+
+def upload_asset(
+    token: str,
+    owner_repo: str,
+    release_id: int,
+    part: AssetPart,
+    archive: Path,
+) -> dict:
+    query = f"name={quote(part.download)}&label={quote(part.label)}"
     path = f"/repos/{owner_repo}/releases/{release_id}/assets?{query}"
-    timeout = max(600, (size // (256 * 1024)) + 120)
+    timeout = max(600, (part.size // (256 * 1024)) + 120)
     headers = {
         "Accept": "application/vnd.github+json",
         "Authorization": f"Bearer {token}",
         "User-Agent": "push-to-github",
         "X-GitHub-Api-Version": "2022-11-28",
         "Content-Type": "application/octet-stream",
-        "Content-Length": str(size),
+        "Content-Length": str(part.size),
         "Accept-Encoding": "identity",
     }
-    proxy = choose_upload_proxy(size)
+    proxy = choose_upload_proxy(part.size)
     direct_only = proxy is None
     if proxy:
         print(f"upload via proxy {proxy[0]}:{proxy[1]}", flush=True)
@@ -464,13 +796,19 @@ def upload_asset(token: str, owner_repo: str, release_id: int, download: str, la
     last = "unknown"
     for attempt in range(1, 4):
         conn = None
+        reader = None
         try:
             conn = open_direct(timeout) if direct_only else open_proxied(timeout, proxy)
-            with archive.open("rb") as handle:
-                conn.request("POST", path, body=handle, headers=headers)
-                resp = conn.getresponse()
-                raw = resp.read()
+            reader = SliceReader(archive, part.start, part.size, part.download)
+            conn.request("POST", path, body=reader, headers=headers)
+            resp = conn.getresponse()
+            raw = resp.read()
             text = raw.decode("utf-8", errors="replace")
+            if reader._sent != part.size:
+                raise SystemExit(f"short upload {part.download}: {reader._sent} != {part.size}")
+            digest = reader.sha256.hexdigest()
+            if part.sha256 and digest != part.sha256:
+                raise SystemExit(f"checksum mismatch while uploading {part.download}")
             if resp.status in {429, 500, 502, 503, 504}:
                 last = f"HTTP {resp.status} {text[:200]}"
                 print(f"upload retry {attempt} {last}", flush=True)
@@ -482,6 +820,11 @@ def upload_asset(token: str, owner_repo: str, release_id: int, download: str, la
             parsed = json.loads(text)
             if not isinstance(parsed, dict):
                 raise SystemExit("upload returned no asset")
+            remote = parsed.get("digest") or ""
+            if isinstance(remote, str) and remote.startswith("sha256:"):
+                if remote.split(":", 1)[1].lower() != digest:
+                    raise SystemExit(f"GitHub digest mismatch for {part.download}")
+            parsed["_sha256"] = digest
             return parsed
         except ProxyConnectError as exc:
             last = f"ProxyConnectError: {exc}"
@@ -492,6 +835,8 @@ def upload_asset(token: str, owner_repo: str, release_id: int, download: str, la
             last = f"{type(exc).__name__}: {exc}"
             print(f"upload retry {attempt} {last}", flush=True)
         finally:
+            if reader is not None:
+                reader.close()
             if conn is not None:
                 conn.close()
     raise SystemExit(f"upload failed: {last}")
@@ -530,19 +875,24 @@ def main(argv: list[str] | None = None) -> int:
     size = archive.stat().st_size
     if size <= 0:
         raise SystemExit("archive is empty")
-    if size > MAX_RELEASE_BYTES:
-        raise SystemExit(f"{size} bytes exceeds the 2 GiB Release asset limit")
 
     repo = args.repo or repo_slug_from_stem(archive.stem)
     if not repo or not SAFE_REPO.fullmatch(repo):
         raise SystemExit("could not derive a repo name; pass --repo (lowercase, dashes) once")
-    download, label = asset_names(archive.name, repo)
+    parts = plan_parts(archive.name, size, repo)
     print(f"archive={archive}")
     print(f"bytes={size}")
     print(f"parent not initialized: {archive.parent}")
     print(f"repo={repo} tag={args.tag} visibility={'public' if args.public else 'private'}")
-    print(f"asset name={download}")
-    print(f"asset label={label}")
+    print(f"parts={len(parts)}")
+    for part in parts:
+        print(
+            f"part {part.index}/{part.count} offset={part.start} bytes={part.size} "
+            f"asset name={part.download} label={part.label}"
+        )
+    if len(parts) > 1:
+        print("note: not under 2 GiB; raw byte-range parts, not zip or 7z volumes")
+        print(join_hint(archive.name, parts))
     if size > 90 * 1024 * 1024:
         print("note: above the git blob cap; Release upload only")
     if args.dry_run:
@@ -561,7 +911,7 @@ def main(argv: list[str] | None = None) -> int:
     login = user["login"]
     env = author_env(login)
 
-    kind, repo, download, label = decide(
+    kind, repo, parts = decide(
         client, login, repo, args.tag, archive.name, size, args.public
     )
     owner_repo = f"{login}/{repo}"
@@ -570,14 +920,19 @@ def main(argv: list[str] | None = None) -> int:
         print("blobs posted=0 reused=0")
         print(f"https://github.com/{owner_repo}")
         print(f"https://github.com/{owner_repo}/releases/tag/{args.tag}")
-        print(f"asset name={download} label={label} size={size}")
+        for part in parts:
+            print(f"asset name={part.download} label={part.label} size={part.size}")
+        print(f"original={archive.name} size={size} parts={len(parts)}")
         print("visibility checked; archive was not uploaded again")
         return 0
+
+    if len(parts) > 1:
+        fill_sha256(archive, parts)
 
     stage = Path(tempfile.mkdtemp(prefix="push-release-"))
     published = False
     try:
-        write_stage(stage, owner_repo, args.tag, download, label, size)
+        write_stage(stage, owner_repo, args.tag, archive.name, size, parts)
         run_git(["init", "-b", "main"], stage, env)
         run_git(["add", "-A"], stage, env)
         status = run_git(["status", "--porcelain"], stage, env).strip()
@@ -588,7 +943,7 @@ def main(argv: list[str] | None = None) -> int:
             env,
         )
         if kind == "create":
-            create_repo(stage, env, repo, args.public, label)
+            create_repo(stage, env, repo, args.public, archive.name)
         else:
             _status, existing, _text = client.request("GET", f"/repos/{owner_repo}")
             if isinstance(existing, dict):
@@ -616,20 +971,14 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit(f"README publish failed: {err[:500]}")
         posted, reused = parse_blobs(proc.stdout or "")
 
-        body = (
-            "Archive published as a Release asset so the binary stays out of git history.\n\n"
-            f"Download name: {download}\n"
-            f"Original filename: {label}\n"
-            f"Size: {size} bytes\n"
-        )
         status, release, text = client.request(
             "POST",
             f"/repos/{owner_repo}/releases",
             payload={
                 "tag_name": args.tag,
                 "target_commitish": "main",
-                "name": label[:120],
-                "body": body,
+                "name": archive.name[:120],
+                "body": release_body(archive.name, size, parts),
                 "draft": False,
                 "prerelease": False,
             },
@@ -647,50 +996,82 @@ def main(argv: list[str] | None = None) -> int:
         if not isinstance(release, dict) or not release.get("id"):
             raise SystemExit(f"create release failed: {text[:400]}")
 
-        def matching_asset(payload: dict) -> dict:
-            for item in payload.get("assets") or []:
-                if int(item.get("size") or -1) == size and (
-                    item.get("name") == download or item.get("label") == label
-                ):
-                    return item
-            raise SystemExit("release asset does not match this archive")
-
-        if asset_matches(release, download, label, size):
-            asset = matching_asset(release)
-        else:
-            print("uploading asset...", flush=True)
-            asset = upload_asset(token, owner_repo, int(release["id"]), download, label, archive)
+        for part in parts:
+            drop_incomplete(client, owner_repo, release, part)
+            reject_size_conflict(release, part)
+            existing = placed_asset(release, part)
+            if existing:
+                print(f"asset exists {part.download} size={part.size}", flush=True)
+                continue
+            print(
+                f"uploading {part.download} offset={part.start} size={part.size}",
+                flush=True,
+            )
+            asset = upload_asset(token, owner_repo, int(release["id"]), part, archive)
             if asset.get("already_exists"):
                 _status, release, _text = client.request(
                     "GET",
                     f"/repos/{owner_repo}/releases/tags/{quote(args.tag, safe='')}",
                 )
-                if not isinstance(release, dict) or not asset_matches(release, download, label, size):
+                if not isinstance(release, dict):
+                    raise SystemExit("could not re-read the release")
+                existing = placed_asset(release, part)
+                if existing is None:
                     raise SystemExit("asset name already exists and does not match this archive")
-                asset = matching_asset(release)
-            elif asset.get("name") != download or asset.get("label") != label:
+                continue
+            if asset.get("name") != part.download or asset.get("label") != part.label:
                 _status, patched, _text = client.request(
                     "PATCH",
                     f"/repos/{owner_repo}/releases/assets/{asset['id']}",
-                    payload={"name": download, "label": label},
+                    payload={"name": part.download, "label": part.label},
                 )
                 if isinstance(patched, dict):
                     asset = patched
-        if asset.get("name") != download:
-            raise SystemExit(f"asset name mismatch: {asset.get('name')}")
-        if int(asset.get("size") or -1) != size:
-            raise SystemExit(f"asset size mismatch: {asset.get('size')} != {size}")
+            if asset.get("name") != part.download:
+                raise SystemExit(f"asset name mismatch: {asset.get('name')}")
+            if int(asset.get("size") or -1) != part.size:
+                raise SystemExit(f"asset size mismatch: {asset.get('size')} != {part.size}")
+            release.setdefault("assets", []).append(asset)
+
+        try:
+            client.request(
+                "PATCH",
+                f"/repos/{owner_repo}/releases/{release['id']}",
+                payload={
+                    "name": archive.name[:120],
+                    "body": release_body(archive.name, size, parts),
+                },
+            )
+        except SystemExit as exc:
+            print(f"release notes were not updated: {exc}")
+
         _status, confirmed, _text = client.request("GET", f"/repos/{owner_repo}")
         wanted_private = not args.public
         if not isinstance(confirmed, dict) or bool(confirmed.get("private")) != wanted_private:
             raise SystemExit("repository visibility does not match the request")
+        _status, release, _text = client.request(
+            "GET",
+            f"/repos/{owner_repo}/releases/tags/{quote(args.tag, safe='')}",
+        )
+        if not isinstance(release, dict) or not parts_uploaded(release, parts):
+            raise SystemExit("release is missing one or more parts after upload")
         published = True
         print(f"blobs posted={posted} reused={reused}")
         print("visibility=" + ("private" if confirmed.get("private") else "public"))
-        print(f"asset name={asset.get('name')} label={asset.get('label')} size={asset.get('size')}")
+        for part in parts:
+            digest = f" sha256={part.sha256}" if part.sha256 else ""
+            print(f"asset name={part.download} label={part.label} size={part.size}{digest}")
+        print(f"original={archive.name} size={size} parts={len(parts)}")
         print(f"https://github.com/{owner_repo}")
         print(release.get("html_url") or f"https://github.com/{owner_repo}/releases/tag/{args.tag}")
-        print("excluded from git: the archive; no env, credential, or log files were staged")
+        if len(parts) > 1:
+            print(join_hint(archive.name, parts))
+            print(
+                "excluded from git: the archive and its parts; "
+                "parts were byte ranges of the original file, not copies"
+            )
+        else:
+            print("excluded from git: the archive; no env, credential, or log files were staged")
         return 0
     finally:
         if published:

@@ -1,5 +1,5 @@
 # Prepend Git and GitHub CLI to PATH for this process.
-# This machine often has git/gh installed but missing from the agent PATH.
+# Agent shells often have git/gh installed but missing from PATH.
 
 $candidates = @(
     'C:\Program Files\Git\cmd',
