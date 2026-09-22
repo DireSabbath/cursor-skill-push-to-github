@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import ssl
 import stat
 import subprocess
@@ -24,6 +25,10 @@ from pathlib import Path
 from urllib.parse import quote
 
 MAX_RELEASE_BYTES = 2 * 1024 * 1024 * 1024
+PROXY_MIN_BYTES = 8 * 1024 * 1024
+UPLOAD_BLOCK = 1024 * 1024
+UPLOAD_HOST = "uploads.github.com"
+DEFAULT_PROXY = "127.0.0.1:20221"
 MARKER = "<!-- push-to-github-release-asset -->"
 SAFE_ASSET = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,200}$")
 SAFE_REPO = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -111,6 +116,16 @@ def self_check() -> None:
     assert looks_secret(Path(".env")) == "env file"
     assert looks_secret(Path("id_rsa.pem")) == "credential file"
     assert looks_secret(Path(CREDENTIAL_NAME + ".txt")) == "credential filename"
+    assert parse_proxy("direct") is None
+    assert parse_proxy("off") is None
+    assert parse_proxy("http://127.0.0.1:20221") == ("127.0.0.1", 20221)
+    assert want_proxy(100, "direct", True) is None
+    assert want_proxy(100, None, True) is None
+    assert want_proxy(PROXY_MIN_BYTES, None, False) is None
+    assert want_proxy(PROXY_MIN_BYTES, None, True) == ("127.0.0.1", 20221)
+    assert want_proxy(100, "http://127.0.0.1:9", False) == ("127.0.0.1", 9)
+    assert connect_established(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+    assert not connect_established(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
     print("check ok")
 
 
@@ -307,6 +322,125 @@ def parse_blobs(output: str) -> tuple[str, str]:
     return match.group(1), match.group(2)
 
 
+class ProxyConnectError(OSError):
+    """Local proxy CONNECT failed before any asset bytes were sent."""
+
+
+def parse_proxy(raw: str | None) -> tuple[str, int] | None:
+    if raw is None:
+        return None
+    text = raw.strip()
+    if not text or text.lower() in {"0", "off", "direct"}:
+        return None
+    text = text.removeprefix("http://").removeprefix("https://")
+    text = text.split("/", 1)[0]
+    host, sep, port_s = text.rpartition(":")
+    if not sep:
+        raise SystemExit("PUSH_GITHUB_PROXY must be host:port or http://host:port")
+    try:
+        port = int(port_s)
+    except ValueError as exc:
+        raise SystemExit("PUSH_GITHUB_PROXY port is not an integer") from exc
+    if not host or port <= 0 or port > 65535:
+        raise SystemExit("PUSH_GITHUB_PROXY host or port is invalid")
+    return host, port
+
+
+def want_proxy(size: int, env_value: str | None, listening: bool) -> tuple[str, int] | None:
+    """Pick a local HTTP proxy for a Release upload.
+
+    Unset env: only files of at least 8 MiB, and only when the default
+    Clash mixed-port is open. ``direct`` / ``off`` stays on a direct POST.
+    An explicit proxy is used even for a small file.
+    """
+    if env_value is not None and env_value.strip().lower() in {"0", "off", "direct"}:
+        return None
+    if env_value is not None and env_value.strip():
+        return parse_proxy(env_value)
+    if size < PROXY_MIN_BYTES or not listening:
+        return None
+    return parse_proxy(DEFAULT_PROXY)
+
+
+def port_open(host: str, port: int, timeout: float = 0.4) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def connect_established(buf: bytes) -> bool:
+    status = buf.split(b"\r\n", 1)[0]
+    return b" 200 " in status
+
+
+def choose_upload_proxy(size: int) -> tuple[str, int] | None:
+    env_value = os.environ.get("PUSH_GITHUB_PROXY")
+    if env_value is not None and env_value.strip().lower() in {"0", "off", "direct"}:
+        return None
+    if env_value is not None and env_value.strip():
+        proxy = parse_proxy(env_value)
+        if proxy is None or not port_open(*proxy):
+            raise SystemExit(f"PUSH_GITHUB_PROXY is not listening: {env_value.strip()}")
+        return proxy
+    return want_proxy(size, None, port_open("127.0.0.1", 20221))
+
+
+def open_direct(timeout: int) -> http.client.HTTPSConnection:
+    conn = http.client.HTTPSConnection(
+        UPLOAD_HOST,
+        timeout=timeout,
+        context=ssl.create_default_context(),
+    )
+    conn.blocksize = UPLOAD_BLOCK
+    return conn
+
+
+def open_proxied(timeout: int, proxy: tuple[str, int]) -> http.client.HTTPSConnection:
+    host, port = proxy
+    raw = None
+    try:
+        raw = socket.create_connection((host, port), timeout=20)
+        raw.settimeout(20)
+        raw.sendall(
+            f"CONNECT {UPLOAD_HOST}:443 HTTP/1.1\r\nHost: {UPLOAD_HOST}:443\r\n\r\n".encode("ascii")
+        )
+        buf = bytearray()
+        while b"\r\n\r\n" not in buf:
+            chunk = raw.recv(4096)
+            if not chunk:
+                raise ProxyConnectError("proxy closed during CONNECT")
+            buf += chunk
+            if len(buf) > 65536:
+                raise ProxyConnectError("proxy CONNECT response too large")
+        head, _, rest = bytes(buf).partition(b"\r\n\r\n")
+        if rest:
+            raise ProxyConnectError("proxy sent unexpected bytes after CONNECT")
+        if not connect_established(head):
+            status = head.split(b"\r\n", 1)[0].decode("latin-1", errors="replace")
+            raise ProxyConnectError(f"proxy CONNECT failed: {status[:160]}")
+        ssock = ssl.create_default_context().wrap_socket(raw, server_hostname=UPLOAD_HOST)
+        raw = None
+        ssock.settimeout(timeout)
+        conn = http.client.HTTPSConnection(
+            UPLOAD_HOST,
+            timeout=timeout,
+            context=ssl.create_default_context(),
+        )
+        conn.sock = ssock
+        conn.blocksize = UPLOAD_BLOCK
+        return conn
+    except ProxyConnectError:
+        if raw is not None:
+            raw.close()
+        raise
+    except (OSError, ssl.SSLError, TimeoutError) as exc:
+        if raw is not None:
+            raw.close()
+        raise ProxyConnectError(str(exc)) from exc
+
+
 def upload_asset(token: str, owner_repo: str, release_id: int, download: str, label: str, archive: Path) -> dict:
     size = archive.stat().st_size
     query = f"name={quote(download)}&label={quote(label)}"
@@ -321,12 +455,17 @@ def upload_asset(token: str, owner_repo: str, release_id: int, download: str, la
         "Content-Length": str(size),
         "Accept-Encoding": "identity",
     }
-    ctx = ssl.create_default_context()
+    proxy = choose_upload_proxy(size)
+    direct_only = proxy is None
+    if proxy:
+        print(f"upload via proxy {proxy[0]}:{proxy[1]}", flush=True)
+    else:
+        print("upload direct", flush=True)
     last = "unknown"
     for attempt in range(1, 4):
         conn = None
         try:
-            conn = http.client.HTTPSConnection("uploads.github.com", timeout=timeout, context=ctx)
+            conn = open_direct(timeout) if direct_only else open_proxied(timeout, proxy)
             with archive.open("rb") as handle:
                 conn.request("POST", path, body=handle, headers=headers)
                 resp = conn.getresponse()
@@ -344,6 +483,11 @@ def upload_asset(token: str, owner_repo: str, release_id: int, download: str, la
             if not isinstance(parsed, dict):
                 raise SystemExit("upload returned no asset")
             return parsed
+        except ProxyConnectError as exc:
+            last = f"ProxyConnectError: {exc}"
+            print(f"proxy connect failed; falling back to direct: {exc}", flush=True)
+            direct_only = True
+            proxy = None
         except (http.client.HTTPException, OSError, ssl.SSLError, TimeoutError) as exc:
             last = f"{type(exc).__name__}: {exc}"
             print(f"upload retry {attempt} {last}", flush=True)

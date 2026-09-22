@@ -79,18 +79,8 @@ python "$env:USERPROFILE/.cursor/skills/push-to-github/scripts/publish-via-gh-ap
 
 Keep-alive to `api.github.com` (do not spawn `gh.exe` per blob). Bootstraps an empty repo with Contents API, then Git Data API. Reuses remote blob SHAs that already match `git hash-object`. Never `git push`. PATCH ref uses `"force": false`.
 
-## Release asset (one file)
+## Large uploads
 
-Do not `git init` the parent of a single archive. Run:
+`http.client` ignores `HTTP_PROXY`. A direct POST of 413209146 bytes to `uploads.github.com` took about 11 minutes (~0.2–0.6 MB/s). A local HTTP proxy on that same network transferred GitHub data at about 2.6 MB/s.
 
-```powershell
-python "$env:USERPROFILE/.cursor/skills/push-to-github/scripts/publish-release-asset.py" "<archive>"
-```
-
-- TEMP README only, then `publish-via-gh-api.py`
-- File bytes: one POST to `uploads.github.com` (not a git blob, not `gh release create`)
-- Asset `name` is ASCII. The original filename goes in `label`, because GitHub drops non-ASCII from the download name
-- Cap: 2 GiB. The git publisher still refuses blobs over 90 MB
-- The same file and size again prints `release already up to date` and does not create a second repo
-- A name owned by another project retries once as `<name>-pkg`, then stops
-- `--public` only when the user asked. Do not upload into an existing public repo by default
+`publish-release-asset.py` uses one `CONNECT` through `127.0.0.1:20221` when that port is listening and the file is at least 8 MiB. It does not change the system proxy and does not read the proxy controller secret. Set `PUSH_GITHUB_PROXY=direct` to force a direct POST, or `PUSH_GITHUB_PROXY=http://127.0.0.1:<port>` for another local proxy. CONNECT failure falls back to direct. That host had no AAAA record; do not wait on IPv6. Calls to `api.github.com` stay direct.

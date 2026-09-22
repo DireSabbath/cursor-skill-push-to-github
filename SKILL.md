@@ -3,8 +3,8 @@ name: push-to-github
 description: >-
   Initialize git if needed, exclude secrets, commit, create a GitHub repo with
   gh, and publish via GitHub API on Windows. Use when the user asks to push to
-  GitHub, create a GitHub repository, gh repo create, or to put one archive on
-  a new private repo Release — especially when git push to github.com:443 fails.
+  GitHub, create a GitHub repository, or gh repo create — especially when git
+  push to github.com:443 fails.
 ---
 
 # Push current project to GitHub
@@ -13,7 +13,7 @@ Cursor skill for Windows. Uses the logged-in **gh** account. Default visibility 
 
 On some networks git to GitHub on port 443 fails, so files are written with the GitHub API.
 
-Do not `git push`. Do not `gh repo create --push`. Publish a git tree only with [scripts/publish-via-gh-api.py](scripts/publish-via-gh-api.py). One archive on a Release goes through [scripts/publish-release-asset.py](scripts/publish-release-asset.py), which calls that publisher for the README only.
+Do not `git push`. Do not `gh repo create --push`. Publish only with [scripts/publish-via-gh-api.py](scripts/publish-via-gh-api.py).
 
 Same lesson as github-partial-download: `gh auth token` once, then keep-alive HTTPS to `api.github.com`. Do **not** spawn `gh.exe` per blob. Unchanged blobs are reused by SHA.
 
@@ -52,36 +52,11 @@ git status --porcelain
 ```
 
 - Already has `origin` -> commit (if needed) and run the publish script. Do not create another repo. Do not change remotes.
-- Not a git repo, and the path is a project directory -> `git init -b main` in the project root.
-- The path is one file -> section 1b. Do not `git init` its parent.
+- Not a git repo -> `git init -b main` in the project root.
 
 Default repo name: project folder, lowercase, dashes only. If the folder is a single character or otherwise ambiguous (`1`, `new`, `tmp`), derive a name from the main artifact (e.g. exe/title) or ask once.
 
 For a **TEMP** sanitized public copy, attach `origin` only to that TEMP git. Never rewrite remotes on the source tree.
-
-## 1b. Release asset (one archive, not a project)
-
-Use this when the user points at a single archive or installer and wants a new private repository with that file on a Release. Do not `git init` in the parent directory.
-
-Use [scripts/publish-release-asset.py](scripts/publish-release-asset.py). Do not reimplement the upload by hand.
-
-```powershell
-python "$env:USERPROFILE/.cursor/skills/push-to-github/scripts/publish-release-asset.py" "<archive>"
-```
-
-Optional: `--repo <name>` when the filename has no usable ASCII slug (`tmp`, a single character, or no letters). `--tag` defaults to `v1.0.0`. `--public` only if the user explicitly asked. Default is private.
-
-The script:
-
-- Does not `git init` the parent directory. A shared projects folder is not the repository.
-- Does not commit the archive. It writes a TEMP git that contains only a README, commits that, creates the repo with `gh repo create --private --source=. --remote=origin` (no `--push`), then publishes the README with `publish-via-gh-api.py`.
-- Uploads the file with one POST to `uploads.github.com`. It does not call `gh release create` (that can try to push a tag) and does not spawn `gh.exe` per chunk.
-- GitHub strips non-ASCII characters from the asset download name. The script sends an ASCII `name` (`<repo><ext>` when the original name is not ASCII) and sets `label` to the original filename.
-- Refuses env files, keys, and credential-like filenames. If it stops for that reason, ask the user before uploading.
-- If that repo already has this file at the same size, it prints `release already up to date` and does not create another repo. If the name belongs to some other project, it retries once with a `-pkg` suffix, then stops.
-- Deletes the TEMP git after a successful upload. It never deletes the GitHub repo.
-
-Report the repo URL, release URL, `asset name=`, `asset label=`, byte size, `blobs posted=` / `reused=`, and that the archive was excluded from git.
 
 ## 2. Secrets and .gitignore
 
@@ -126,9 +101,17 @@ The script bootstraps an empty GitHub repo with Contents API, then writes the HE
 
 Do not create a second repo.
 
+## Large uploads to uploads.github.com
+
+`http.client` does not use `HTTP_PROXY`. On a network where a direct POST was slow, a 413209146-byte archive took about 11 minutes (~0.2–0.6 MB/s). Through a local HTTP proxy, GitHub transfer was about 2.6 MB/s.
+
+[scripts/publish-release-asset.py](scripts/publish-release-asset.py) sends one POST to `uploads.github.com`. For a file of at least 8 MiB, if `127.0.0.1:20221` is listening (a Clash mixed-port), it opens `CONNECT` to `uploads.github.com:443` and uploads through that tunnel. It does not change the system proxy and does not read the proxy controller secret. `PUSH_GITHUB_PROXY=direct` forces a direct POST. `PUSH_GITHUB_PROXY=http://127.0.0.1:<port>` selects another local proxy. If CONNECT fails, it falls back to direct.
+
+`uploads.github.com` had no AAAA record on that network. Do not wait on IPv6. JSON calls to `api.github.com` stay direct. Do not abort an upload that has already finished just to retry on the faster path.
+
 ## 5. Report
 
-Return the HTTPS URL (`https://github.com/<login>/<name>`), private/public, what was excluded (secrets, logs), and blob posted vs reused. For a Release asset, also return the release URL, asset name, label, and size.
+Return the HTTPS URL (`https://github.com/<login>/<name>`), private/public, what was excluded (secrets, logs), and blob posted vs reused.
 
 ## Hard limits
 
@@ -139,6 +122,3 @@ Return the HTTPS URL (`https://github.com/<login>/<name>`), private/public, what
 - Never rewrite existing remotes
 - Never skip hooks (`--no-verify`)
 - Never commit secrets
-- Never `git init` the parent of a single archive
-- Never `gh release create`
-- Never commit an archive the user asked to put on a Release
