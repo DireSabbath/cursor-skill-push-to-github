@@ -78,3 +78,19 @@ python "$env:USERPROFILE/.cursor/skills/push-to-github/scripts/publish-via-gh-ap
 ```
 
 Keep-alive to `api.github.com` (do not spawn `gh.exe` per blob). Bootstraps an empty repo with Contents API, then Git Data API. Reuses remote blob SHAs that already match `git hash-object`. Never `git push`. PATCH ref uses `"force": false`.
+
+## Release asset (one file)
+
+Do not `git init` the parent of a single archive. Run:
+
+```powershell
+python "$env:USERPROFILE/.cursor/skills/push-to-github/scripts/publish-release-asset.py" "<archive>"
+```
+
+- TEMP README only, then `publish-via-gh-api.py`
+- File bytes: one POST to `uploads.github.com` (not a git blob, not `gh release create`)
+- Asset `name` is ASCII. The original filename goes in `label`, because GitHub drops non-ASCII from the download name
+- Cap: 2 GiB. The git publisher still refuses blobs over 90 MB
+- The same file and size again prints `release already up to date` and does not create a second repo
+- A name owned by another project retries once as `<name>-pkg`, then stops
+- `--public` only when the user asked. Do not upload into an existing public repo by default
