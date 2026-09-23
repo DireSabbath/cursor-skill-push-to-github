@@ -41,7 +41,6 @@ Always gitignore (do not stage):
 
 - `.env`, `.env.*`, `credentials.json`, `*secret*`, `*token*`
 - log directories
-- credential files
 - key/pem/p12 files
 
 Write `.gitignore` as UTF-8 (Python `encoding='utf-8'`). Scan before `git add`:
@@ -78,21 +77,18 @@ From the project root, after a local commit:
 python "$env:USERPROFILE/.cursor/skills/push-to-github/scripts/publish-via-gh-api.py"
 ```
 
-Keep-alive to `api.github.com` (do not spawn `gh.exe` per blob — same regression as spawning `gh api` per download). Bootstraps an empty repo with Contents API, then Git Data API. Reuses remote blob SHAs that already match `git hash-object`. Never `git push`. PATCH ref uses `"force": false`.
+Keep-alive to `api.github.com` (do not spawn `gh.exe` per blob). Bootstraps an empty repo with Contents API, then Git Data API. Reuses remote blob SHAs that already match `git hash-object`. Never `git push`. PATCH ref uses `"force": false`.
 
-## Release asset (one file)
+## Large uploads
 
-Do not `git init` the parent of a single archive. Run:
+`http.client` ignores `HTTP_PROXY`. A direct POST of 413209146 bytes to `uploads.github.com` took about 11 minutes (~0.2–0.6 MB/s). A local HTTP proxy on that same network transferred GitHub data at about 2.6 MB/s.
+
+`publish-release-asset.py` uses one `CONNECT` through `127.0.0.1:20221` when that port is listening, for any file size. It does not change the system proxy and does not read the proxy controller secret. A turned-off system proxy is not used. Set `PUSH_GITHUB_PROXY=direct` to force a direct POST, or `PUSH_GITHUB_PROXY=http://127.0.0.1:<port>` for another local proxy. CONNECT failure falls back to direct. That host had no AAAA record; do not wait on IPv6. Calls to `api.github.com` stay direct.
+
+## Append to an existing Release
 
 ```powershell
-python "$env:USERPROFILE/.cursor/skills/push-to-github/scripts/publish-release-asset.py" "<archive>"
+python "$env:USERPROFILE/.cursor/skills/push-to-github/scripts/publish-release-asset.py" "<file>" --onto "https://github.com/<owner>/<repo>/releases"
 ```
 
-- TEMP README only, then `publish-via-gh-api.py`
-- File bytes: one POST per part to `uploads.github.com` (not a git blob, not `gh release create`)
-- At least 8 MiB: `CONNECT` through `127.0.0.1:20221` when that port is listening. Direct was ~0.2–0.6 MB/s (413209146 bytes, about 11 minutes); the proxy path was about 2.6 MB/s. When that port is closed, direct upload is used. A later direct part just under 2 GiB reached about 11 MB/s (about 2.7 GiB in two parts, about 6 minutes). Override with `PUSH_GITHUB_PROXY=direct` or `PUSH_GITHUB_PROXY=http://127.0.0.1:<port>`. Do not change the system proxy. Do not read the proxy secret. Do not wait on IPv6 if `uploads.github.com` has no AAAA record. `api.github.com` stays direct.
-- Asset `name` is ASCII. The original filename goes in `label`, because GitHub drops non-ASCII from the download name
-- Cap: each Release file must be under 2 GiB. At or above that, the script uploads raw `.001`, `.002`, ... parts (at most 2 GiB minus 1 byte) read from the original file. It does not write a second copy and does not commit the parts. They are not zip or 7z volumes. Join with `copy /b`. Progress prints every 64 MiB. The same part sizes again print `release already up to date`. The git publisher still refuses blobs over 90 MB
-- The same file and size again prints `release already up to date` and does not create a second repo
-- A name owned by another project retries once as `<name>-pkg`, then stops
-- `--public` only when the user asked. Do not upload into an existing public repo by default
+Do not create a repo and do not commit the file. Confirm the upload with `GET /repos/<owner>/<repo>/releases/<id>/assets`. Files under 8 MiB wait at most 60 seconds per attempt (three attempts). A 164642-byte direct POST failed once on connect and once on write; the next attempt finished at about 0.10 MB/s.

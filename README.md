@@ -31,7 +31,7 @@ Agent shells often lack `git`/`gh` on PATH. Run:
 3. Commit with env-var identity if `user.name` is unset (never `git config`)
 4. `gh repo create <name> --private --source=. --remote=origin` (no `--push`) only when `origin` is missing
 5. `python .../publish-via-gh-api.py`
-6. One archive goes on a Release via `scripts/publish-release-asset.py`, not into git
+6. To add one file to an existing Release: `publish-release-asset.py "<file>" --onto "https://github.com/<owner>/<repo>/releases"` (no new repo, no `git init`)
 
 ## Implementation notes
 
@@ -39,10 +39,9 @@ Agent shells often lack `git`/`gh` on PATH. Run:
 - Empty repo: Contents API bootstrap, then Git Data API tree + commit
 - Reuse remote blob SHAs that already match `git hash-object`
 - PATCH ref uses `"force": false`
-- Each Release file must be under 2 GiB. A larger file is uploaded as raw `.001`, `.002`, ... byte ranges of the original. Those parts are not committed and are not zip or 7z volumes. Join them with `copy /b`.
-- Release assets of at least 8 MiB use `CONNECT` through `127.0.0.1:20221` when that port is open. A direct 413209146-byte upload was about 11 minutes (~0.2-0.6 MB/s); the proxy path was about 2.6 MB/s. When that port is closed, a later direct upload of a part just under 2 GiB reached about 11 MB/s (about 2.7 GiB in two parts, about 6 minutes). Override with `PUSH_GITHUB_PROXY`
+- Release uploads use `CONNECT` through `127.0.0.1:20221` whenever that port is open, including files under 8 MiB. A direct 413209146-byte upload was about 11 minutes (~0.2–0.6 MB/s); the proxy path was about 2.6 MB/s. A 164642-byte direct POST stalled and finished on a later attempt at about 0.10 MB/s; files under 8 MiB use a 60-second timeout per attempt. Override with `PUSH_GITHUB_PROXY`
 
-Agent flow: [SKILL.md](SKILL.md). Notes: [reference.md](reference.md).
+Agent flow: [SKILL.md](SKILL.md). Local notes: [reference.md](reference.md).
 
 ## License
 

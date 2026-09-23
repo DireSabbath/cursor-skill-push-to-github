@@ -222,6 +222,100 @@ class SliceReader:
         self._fh.close()
 
 
+ONTO_RE = re.compile(
+    r"^(?:https?://github\.com/)?"
+    r"(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)"
+    r"(?:/releases(?:/tag/(?P<tag>[A-Za-z0-9._-]+)|/latest)?)?"
+    r"/?$"
+)
+CONTENT_TYPES = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".pdf": "application/pdf",
+}
+SMALL_ATTEMPT_TIMEOUT = 60
+
+
+def parse_onto(text: str) -> tuple[str, str | None]:
+    """Return (owner/repo, tag or None) for an existing release URL.
+
+    No tag means the latest release. This does not create a repository.
+    """
+    match = ONTO_RE.fullmatch(text.strip())
+    if not match:
+        raise SystemExit(
+            "--onto must be owner/repo or https://github.com/owner/repo/releases[/tag/<tag>]"
+        )
+    tag = match.group("tag")
+    if tag and not SAFE_TAG.fullmatch(tag):
+        raise SystemExit(f"tag must match {SAFE_TAG.pattern}")
+    return f"{match.group('owner')}/{match.group('repo')}", tag
+
+
+def ascii_asset_name(original_name: str, explicit: str | None) -> str:
+    """ASCII download name. Never uses the repository name.
+
+    GitHub drops non-ASCII from an asset name. A Chinese filename that still
+    contains letters or digits keeps those (`20240102_3.jpg` -> `20240102-3.jpg`).
+    """
+    if explicit:
+        if not SAFE_ASSET.fullmatch(explicit):
+            raise SystemExit(f"--name must match {SAFE_ASSET.pattern}")
+        return explicit
+    if original_name.isascii() and SAFE_ASSET.fullmatch(original_name):
+        return original_name
+    parts = re.findall(r"[A-Za-z0-9]+", Path(original_name).stem)
+    slug = "-".join(part.lower() for part in parts)
+    slug = re.sub(r"-{2,}", "-", slug).strip("-")
+    suffix = split_suffix(original_name)
+    if len(slug) >= 2 and slug not in AMBIGUOUS_REPOS:
+        name = f"{slug}{suffix}"
+        if SAFE_ASSET.fullmatch(name):
+            return name
+    raise SystemExit("could not derive an ASCII asset name; pass --name once")
+
+
+def content_type_for(filename: str) -> str:
+    return CONTENT_TYPES.get(Path(filename).suffix.lower(), "application/octet-stream")
+
+
+def attempt_timeout(size: int) -> int:
+    """Per-attempt socket timeout.
+
+    A 164642-byte direct POST stalled: connect timeout, then a write timeout,
+    then a later attempt finished. Small files must not sit on a 600s timeout.
+    """
+    if size < PROXY_MIN_BYTES:
+        return SMALL_ATTEMPT_TIMEOUT
+    return max(600, (size // (256 * 1024)) + 120)
+
+
+def append_parts(original_name: str, total: int, download: str) -> list[AssetPart]:
+    """One asset under 2 GiB. Larger files use the same raw byte-range parts."""
+    if total < MAX_RELEASE_BYTES:
+        return [AssetPart(1, 1, 0, total, download, original_name)]
+    suffix = split_suffix(original_name)
+    slug = download[: -len(suffix)] if suffix and download.endswith(suffix) else download
+    return plan_parts(original_name, total, slug.lower())
+
+
+def append_asset_note(body: str, download: str, label: str) -> str | None:
+    """One extra bullet. None when the download name is already in the notes."""
+    if download in (body or ""):
+        return None
+    if label != download:
+        line = "- `" + download + "` — \u539f\u6587\u4ef6\u540d\uff1a" + label
+    else:
+        line = "- `" + download + "`"
+    base = body or ""
+    if base and not base.endswith("\n"):
+        base += "\n"
+    return base + line + "\n"
+
+
 def looks_secret(path: Path) -> str | None:
     name = path.name
     lower = name.lower()
@@ -258,9 +352,48 @@ def self_check() -> None:
     assert parse_proxy("off") is None
     assert parse_proxy("http://127.0.0.1:20221") == ("127.0.0.1", 20221)
     assert want_proxy(100, "direct", True) is None
-    assert want_proxy(100, None, True) is None
+    assert want_proxy(100, None, False) is None
+    assert want_proxy(100, None, True) == ("127.0.0.1", 20221)
     assert want_proxy(PROXY_MIN_BYTES, None, False) is None
     assert want_proxy(PROXY_MIN_BYTES, None, True) == ("127.0.0.1", 20221)
+    assert parse_onto("https://github.com/octocat/example/releases") == ("octocat/example", None)
+    assert parse_onto("https://github.com/octocat/example/releases/") == ("octocat/example", None)
+    assert parse_onto("https://github.com/octocat/example/releases/latest") == (
+        "octocat/example",
+        None,
+    )
+    assert parse_onto("https://github.com/octocat/example/releases/tag/v1.2.3") == (
+        "octocat/example",
+        "v1.2.3",
+    )
+    assert parse_onto("octocat/example") == ("octocat/example", None)
+    picture = "\u56fe\u7247_20240102_3.jpg"
+    assert ascii_asset_name(picture, None) == "20240102-3.jpg"
+    assert ascii_asset_name("photo.jpg", None) == "photo.jpg"
+    assert ascii_asset_name(picture, "reference-image.jpg") == "reference-image.jpg"
+    try:
+        ascii_asset_name("\u56fe.jpg", None)
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("non-ascii name without a slug must stop")
+    try:
+        parse_onto("https://github.com/octocat/example/issues")
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("non-release URL must stop")
+    assert content_type_for("a.jpg") == "image/jpeg"
+    assert content_type_for("a.7z") == "application/octet-stream"
+    assert attempt_timeout(164642) == SMALL_ATTEMPT_TIMEOUT
+    assert attempt_timeout(PROXY_MIN_BYTES) >= 600
+    noted = append_asset_note("keep\n", "20240102-3.jpg", picture)
+    assert noted is not None and noted.startswith("keep\n") and "20240102-3.jpg" in noted
+    assert picture in noted
+    assert append_asset_note(noted, "20240102-3.jpg", picture) is None
+    one_append = append_parts(picture, 164642, "20240102-3.jpg")
+    assert len(one_append) == 1 and one_append[0].download == "20240102-3.jpg"
+    assert one_append[0].label == picture and one_append[0].size == 164642
     assert want_proxy(100, "http://127.0.0.1:9", False) == ("127.0.0.1", 9)
     assert connect_established(b"HTTP/1.1 200 Connection Established\r\n\r\n")
     assert not connect_established(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
@@ -507,6 +640,21 @@ def parts_uploaded(release: dict, parts: list[AssetPart]) -> bool:
     return all(placed_asset(release, part) is not None for part in parts)
 
 
+def named_uploaded(release: dict, part: AssetPart) -> dict | None:
+    """Match the ASCII download name and size. Label alone is not a match."""
+    for asset in release.get("assets") or []:
+        if asset.get("state") not in (None, "uploaded"):
+            continue
+        if asset.get("name") != part.download:
+            continue
+        if int(asset.get("size") or -1) != part.size:
+            raise SystemExit(
+                f"asset {part.download} exists with size {asset.get('size')} != {part.size}"
+            )
+        return asset
+    return None
+
+
 def readme_matches(
     client,
     owner_repo: str,
@@ -553,8 +701,10 @@ def classify(
         f"/repos/{owner_repo}/releases/tags/{quote(tag, safe='')}",
         allow_http=(404,),
     )
-    if status == 200 and isinstance(release, dict) and parts_uploaded(release, parts):
-        return "uptodate"
+    if status == 200 and isinstance(release, dict) and release.get("id"):
+        release["assets"] = fetch_assets(client, owner_repo, int(release["id"]))
+        if parts_uploaded(release, parts):
+            return "uptodate"
     if readme_matches(client, owner_repo, original_name, total, parts):
         return "reuse"
     if ours and int(repo.get("size") or 0) == 0:
@@ -655,15 +805,18 @@ def parse_proxy(raw: str | None) -> tuple[str, int] | None:
 def want_proxy(size: int, env_value: str | None, listening: bool) -> tuple[str, int] | None:
     """Pick a local HTTP proxy for a Release upload.
 
-    Unset env: only files of at least 8 MiB, and only when the default
-    Clash mixed-port is open. ``direct`` / ``off`` stays on a direct POST.
-    An explicit proxy is used even for a small file.
+    Unset env: use 127.0.0.1:20221 when that port is listening, for any file
+    size. A small direct POST can stall the same way a large one does.
+    ``direct`` / ``off`` stays on a direct POST. An explicit proxy is used
+    even when the default port is closed. A turned-off system proxy is not
+    read and is not used.
     """
+    del size  # proxy choice no longer depends on size; kept for callers
     if env_value is not None and env_value.strip().lower() in {"0", "off", "direct"}:
         return None
     if env_value is not None and env_value.strip():
         return parse_proxy(env_value)
-    if size < PROXY_MIN_BYTES or not listening:
+    if not listening:
         return None
     return parse_proxy(DEFAULT_PROXY)
 
@@ -768,22 +921,43 @@ def drop_incomplete(client, owner_repo: str, release: dict, part: AssetPart) -> 
     release["assets"] = kept
 
 
+def fetch_assets(client, owner_repo: str, release_id: int) -> list[dict]:
+    """List assets from the releases assets API.
+
+    The `assets` array embedded in the release object can omit a file that
+    was just uploaded. Do not use that array to decide the upload finished.
+    """
+    found: list[dict] = []
+    for page in range(1, 11):
+        _status, listed, _text = client.request(
+            "GET",
+            f"/repos/{owner_repo}/releases/{release_id}/assets?per_page=100&page={page}",
+        )
+        if not isinstance(listed, list):
+            raise SystemExit("could not list release assets")
+        found.extend(item for item in listed if isinstance(item, dict))
+        if len(listed) < 100:
+            return found
+    raise SystemExit("release has more than 1000 assets")
+
+
 def upload_asset(
     token: str,
     owner_repo: str,
     release_id: int,
     part: AssetPart,
     archive: Path,
+    content_type: str = "application/octet-stream",
 ) -> dict:
     query = f"name={quote(part.download)}&label={quote(part.label)}"
     path = f"/repos/{owner_repo}/releases/{release_id}/assets?{query}"
-    timeout = max(600, (part.size // (256 * 1024)) + 120)
+    timeout = attempt_timeout(part.size)
     headers = {
         "Accept": "application/vnd.github+json",
         "Authorization": f"Bearer {token}",
         "User-Agent": "push-to-github",
         "X-GitHub-Api-Version": "2022-11-28",
-        "Content-Type": "application/octet-stream",
+        "Content-Type": content_type,
         "Content-Length": str(part.size),
         "Accept-Encoding": "identity",
     }
@@ -842,11 +1016,164 @@ def upload_asset(
     raise SystemExit(f"upload failed: {last}")
 
 
+def part_content_type(part: AssetPart) -> str:
+    if part.count == 1:
+        return content_type_for(part.download)
+    return "application/octet-stream"
+
+
+def append_existing(args, archive: Path, size: int) -> int:
+    """Add one file to a release that already exists. Do not create a repo."""
+    if args.public:
+        raise SystemExit("--onto does not create a repo or change visibility")
+    owner_repo, url_tag = parse_onto(args.onto)
+    if args.repo and args.repo != owner_repo.split("/", 1)[1]:
+        raise SystemExit("--repo does not match --onto")
+    tag = args.tag or url_tag
+    if tag and not SAFE_TAG.fullmatch(tag):
+        raise SystemExit(f"tag must match {SAFE_TAG.pattern}")
+    download = ascii_asset_name(archive.name, args.name)
+    parts = append_parts(archive.name, size, download)
+    print(f"archive={archive}")
+    print(f"bytes={size}")
+    print(f"parent not initialized: {archive.parent}")
+    print(f"onto={owner_repo} tag={tag or 'latest'}")
+    print("no repo created; file will not be committed")
+    for part in parts:
+        print(
+            f"part {part.index}/{part.count} offset={part.start} bytes={part.size} "
+            f"asset name={part.download} label={part.label} "
+            f"content_type={part_content_type(part)}"
+        )
+    if len(parts) > 1:
+        print("note: not under 2 GiB; raw byte-range parts, not zip or 7z volumes")
+        print(join_hint(archive.name, parts))
+    if args.dry_run:
+        print("dry-run: no repo created, no upload")
+        return 0
+
+    publisher = load_publisher()
+    publisher.prepend_tool_path()
+    token = publisher.gh_token()
+    if not token:
+        raise SystemExit("gh auth token failed")
+    client = publisher.GithubApi(token)
+    status, repo, _text = client.request("GET", f"/repos/{owner_repo}", allow_http=(404,))
+    if status == 404:
+        raise SystemExit(f"repository does not exist: {owner_repo}")
+    if status != 200 or not isinstance(repo, dict):
+        raise SystemExit(f"could not read repo {owner_repo}")
+    if tag:
+        release_path = f"/repos/{owner_repo}/releases/tags/{quote(tag, safe='')}"
+    else:
+        release_path = f"/repos/{owner_repo}/releases/latest"
+    status, release, _text = client.request("GET", release_path, allow_http=(404,))
+    if status == 404 or not isinstance(release, dict) or not release.get("id"):
+        raise SystemExit("no release to append to; not creating one")
+    release_id = int(release["id"])
+    tag = release.get("tag_name") or tag or ""
+    release["assets"] = fetch_assets(client, owner_repo, release_id)
+    if len(parts) > 1:
+        fill_sha256(archive, parts)
+
+    uploaded_any = False
+    for part in parts:
+        drop_incomplete(client, owner_repo, release, part)
+        if named_uploaded(release, part):
+            print(f"asset exists {part.download} size={part.size}", flush=True)
+            continue
+        print(
+            f"uploading {part.download} offset={part.start} size={part.size}",
+            flush=True,
+        )
+        asset = upload_asset(
+            token,
+            owner_repo,
+            release_id,
+            part,
+            archive,
+            content_type=part_content_type(part),
+        )
+        if asset.get("already_exists"):
+            release["assets"] = fetch_assets(client, owner_repo, release_id)
+            if named_uploaded(release, part) is None:
+                raise SystemExit("asset name already exists and does not match this file")
+            continue
+        if asset.get("name") != part.download or asset.get("label") != part.label:
+            _status, patched, _text = client.request(
+                "PATCH",
+                f"/repos/{owner_repo}/releases/assets/{asset['id']}",
+                payload={"name": part.download, "label": part.label},
+            )
+            if isinstance(patched, dict):
+                asset = patched
+        if asset.get("name") != part.download:
+            raise SystemExit(f"asset name mismatch: {asset.get('name')}")
+        if int(asset.get("size") or -1) != part.size:
+            raise SystemExit(f"asset size mismatch: {asset.get('size')} != {part.size}")
+        uploaded_any = True
+        release["assets"] = fetch_assets(client, owner_repo, release_id)
+
+    release["assets"] = fetch_assets(client, owner_repo, release_id)
+    if any(named_uploaded(release, part) is None for part in parts):
+        raise SystemExit("release is missing the file after upload")
+
+    notes = release.get("body") or ""
+    changed = False
+    for part in parts:
+        updated = append_asset_note(notes, part.download, part.label)
+        if updated is not None:
+            notes = updated
+            changed = True
+    if changed:
+        client.request(
+            "PATCH",
+            f"/repos/{owner_repo}/releases/{release_id}",
+            payload={"body": notes},
+        )
+        print("notes appended")
+    else:
+        print("notes already mention the file")
+
+    if not uploaded_any:
+        print("release already up to date")
+    print("blobs posted=0 reused=0")
+    print("visibility=" + ("private" if repo.get("private") else "public"))
+    fresh = fetch_assets(client, owner_repo, release_id)
+    release["assets"] = fresh
+    if any(named_uploaded(release, part) is None for part in parts):
+        raise SystemExit("release asset list does not include the file")
+    for part in parts:
+        placed = named_uploaded(release, part) or {}
+        digest = f" sha256={part.sha256}" if part.sha256 else ""
+        print(
+            f"asset name={part.download} label={placed.get('label')} "
+            f"size={placed.get('size')} content_type={placed.get('content_type')}{digest}"
+        )
+    print(f"original={archive.name} size={size} parts={len(parts)}")
+    print(f"https://github.com/{owner_repo}")
+    print(release.get("html_url") or f"https://github.com/{owner_repo}/releases/tag/{tag}")
+    if len(parts) > 1:
+        print(join_hint(archive.name, parts))
+        print(
+            "excluded from git: the file and its parts were not committed; "
+            "parts were byte ranges of the original file, not copies"
+        )
+    else:
+        print("excluded from git: the file was not committed")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Publish one archive as a GitHub Release asset.")
     parser.add_argument("archive", nargs="?", help="archive, installer, or other single file")
     parser.add_argument("--repo", help="repository name (lowercase, dashes). Owner is the logged-in user.")
-    parser.add_argument("--tag", default="v1.0.0")
+    parser.add_argument("--tag", default=None, help="release tag. Default v1.0.0 for a new repo.")
+    parser.add_argument(
+        "--onto",
+        help="existing owner/repo or releases URL. Append the file; do not create a repo.",
+    )
+    parser.add_argument("--name", help="ASCII download name when appending to an existing release")
     parser.add_argument("--public", action="store_true", help="create a public repo. Default is private.")
     parser.add_argument("--check", action="store_true", help="run offline name and secret checks")
     parser.add_argument("--dry-run", action="store_true", help="print the plan; do not create a repo or upload")
@@ -863,8 +1190,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if not args.archive:
         raise SystemExit("archive path required")
-    if not SAFE_TAG.fullmatch(args.tag):
-        raise SystemExit(f"tag must match {SAFE_TAG.pattern}")
 
     archive = Path(args.archive).expanduser().resolve()
     if not archive.is_file():
@@ -875,6 +1200,12 @@ def main(argv: list[str] | None = None) -> int:
     size = archive.stat().st_size
     if size <= 0:
         raise SystemExit("archive is empty")
+    if args.onto:
+        return append_existing(args, archive, size)
+    if not args.tag:
+        args.tag = "v1.0.0"
+    if not SAFE_TAG.fullmatch(args.tag):
+        raise SystemExit(f"tag must match {SAFE_TAG.pattern}")
 
     repo = args.repo or repo_slug_from_stem(archive.stem)
     if not repo or not SAFE_REPO.fullmatch(repo):
@@ -1007,14 +1338,26 @@ def main(argv: list[str] | None = None) -> int:
                 f"uploading {part.download} offset={part.start} size={part.size}",
                 flush=True,
             )
-            asset = upload_asset(token, owner_repo, int(release["id"]), part, archive)
+            asset = upload_asset(
+                token,
+                owner_repo,
+                int(release["id"]),
+                part,
+                archive,
+                content_type=(
+                    content_type_for(part.download)
+                    if part.count == 1
+                    else "application/octet-stream"
+                ),
+            )
             if asset.get("already_exists"):
                 _status, release, _text = client.request(
                     "GET",
                     f"/repos/{owner_repo}/releases/tags/{quote(args.tag, safe='')}",
                 )
-                if not isinstance(release, dict):
+                if not isinstance(release, dict) or not release.get("id"):
                     raise SystemExit("could not re-read the release")
+                release["assets"] = fetch_assets(client, owner_repo, int(release["id"]))
                 existing = placed_asset(release, part)
                 if existing is None:
                     raise SystemExit("asset name already exists and does not match this archive")
@@ -1053,7 +1396,10 @@ def main(argv: list[str] | None = None) -> int:
             "GET",
             f"/repos/{owner_repo}/releases/tags/{quote(args.tag, safe='')}",
         )
-        if not isinstance(release, dict) or not parts_uploaded(release, parts):
+        if not isinstance(release, dict) or not release.get("id"):
+            raise SystemExit("release is missing one or more parts after upload")
+        release["assets"] = fetch_assets(client, owner_repo, int(release["id"]))
+        if not parts_uploaded(release, parts):
             raise SystemExit("release is missing one or more parts after upload")
         published = True
         print(f"blobs posted={posted} reused={reused}")
